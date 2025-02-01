@@ -61,40 +61,31 @@ export const PipeStore: React.FC = () => {
       const plugins = await pipeApi.listStorePlugins();
 
       // Create PipeWithStatus objects for store plugins
-      const storePluginsWithStatus = plugins.map((plugin) => ({
-        ...plugin,
-        is_installed: installedPipes.some((p) => p.config?.id === plugin.id),
-        installed_config: installedPipes.find((p) => p.config?.id === plugin.id)
-          ?.config,
-        has_purchased: purchaseHistory.some((p) => p.plugin_id === plugin.id),
-        is_core_pipe: corePipes.includes(plugin.name),
-      }));
+      const storePluginsWithStatus = null;
 
-      const customPipes = installedPipes
-        .filter((p) => !plugins.some((plugin) => plugin.id === p.config?.id))
-        .map((p) => {
-          console.log(p.config);
+      const customPipes = installedPipes.map((p) => {
+        console.log(p.config);
 
-          const pluginName = p.config?.source?.split("/").pop();
-          return {
-            id: p.config?.id || "",
-            name: pluginName || "",
-            description: "",
-            version: p.config?.version || "0.0.0",
-            is_paid: false,
-            price: 0,
-            status: "active",
-            created_at: new Date().toISOString(),
-            developer_accounts: { developer_name: "You" },
-            plugin_analytics: { downloads_count: 0 },
-            is_installed: true,
-            installed_config: p.config,
-            has_purchased: true,
-            is_core_pipe: false,
-          };
-        });
+        const pluginName = p.config?.source?.split("/").pop();
+        return {
+          id: p.config?.id || "",
+          name: pluginName || "",
+          description: "",
+          version: p.config?.version || "0.0.0",
+          is_paid: false,
+          price: 0,
+          status: "active",
+          created_at: new Date().toISOString(),
+          developer_accounts: { developer_name: "You" },
+          plugin_analytics: { downloads_count: 0 },
+          is_installed: true,
+          installed_config: p.config,
+          has_purchased: true,
+          is_core_pipe: false,
+        };
+      });
 
-      setPipes([...storePluginsWithStatus, ...customPipes]);
+      setPipes([...customPipes]);
     } catch (error) {
       console.error("Failed to fetch store plugins:", error);
       toast({
