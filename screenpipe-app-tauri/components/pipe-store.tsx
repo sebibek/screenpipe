@@ -55,6 +55,20 @@ export const PipeStore: React.FC = () => {
     )
     .sort((a, b) => Number(b.is_paid) - Number(a.is_paid));
 
+  // Add debounced search tracking
+  useEffect(() => {
+    const timeoutId = setTimeout(() => {
+      if (searchQuery) {
+        posthog.capture("search_pipes", {
+          query: searchQuery,
+          results_count: filteredPipes.length,
+        });
+      }
+    }, 1000); // Debounce for 1 second
+
+    return () => clearTimeout(timeoutId);
+  }, [searchQuery, filteredPipes.length]);
+
   const fetchStorePlugins = async () => {
     try {
       const pipeApi = await PipeApi.create(settings.user?.token!);
@@ -66,24 +80,24 @@ export const PipeStore: React.FC = () => {
       const customPipes = installedPipes.map((p) => {
         console.log(p.config);
 
-        const pluginName = p.config?.source?.split("/").pop();
-        return {
-          id: p.config?.id || "",
-          name: pluginName || "",
-          description: "",
-          version: p.config?.version || "0.0.0",
-          is_paid: false,
-          price: 0,
-          status: "active",
-          created_at: new Date().toISOString(),
-          developer_accounts: { developer_name: "You" },
-          plugin_analytics: { downloads_count: 0 },
-          is_installed: true,
-          installed_config: p.config,
-          has_purchased: true,
-          is_core_pipe: false,
-        };
-      });
+          const pluginName = p.config?.source?.split("/").pop();
+          return {
+            id: p.config?.id || "",
+            name: pluginName || "",
+            description: "",
+            version: p.config?.version || "0.0.0",
+            is_paid: false,
+            price: 0,
+            status: "active",
+            created_at: new Date().toISOString(),
+            developer_accounts: { developer_name: "You" },
+            plugin_analytics: { downloads_count: 0 },
+            is_installed: true,
+            installed_config: p.config,
+            has_purchased: true,
+            is_core_pipe: false,
+          };
+        });
 
       setPipes([...customPipes]);
     } catch (error) {
@@ -100,7 +114,6 @@ export const PipeStore: React.FC = () => {
     if (!settings.user?.token) return;
     const pipeApi = await PipeApi.create(settings.user!.token!);
     const purchaseHistory = await pipeApi.getUserPurchaseHistory();
-    console.log("purchase history", purchaseHistory);
     setPurchaseHistory(purchaseHistory);
   };
 
@@ -223,8 +236,6 @@ export const PipeStore: React.FC = () => {
     onComplete?: () => void
   ) => {
     try {
-      console.log("user", settings.user);
-
       if (!checkLogin(settings.user)) return;
 
       // Keep the pipe in its current position by updating its status
@@ -414,12 +425,10 @@ export const PipeStore: React.FC = () => {
         throw new Error(data.error);
       }
 
-      console.log("data", data);
       toast({
         title: `pipe ${endpoint}d`,
       });
       const installedPipes = await fetchInstalledPipes();
-      console.log("installedPipes", installedPipes);
 
       const pp = installedPipes?.find((p) => p.config.id === pipe.id);
       const port = pp?.config.port;
@@ -720,8 +729,6 @@ export const PipeStore: React.FC = () => {
             await new Promise((resolve) => setTimeout(resolve, 1000));
 
             fetchPurchaseHistory();
-
-            console.log("pipes", pipes);
           }
         }
       });
@@ -818,6 +825,7 @@ export const PipeStore: React.FC = () => {
                 onPurchase={handlePurchasePipe}
                 isLoadingPurchase={loadingPurchases.has(pipe.id)}
                 isLoadingInstall={loadingInstalls.has(pipe.id)}
+                onToggle={handleTogglePipe}
               />
             ))}
           </div>
