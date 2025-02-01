@@ -97,11 +97,14 @@ jobs:
             sed -i 's/^version = ".*"/version = "${{ github.event.inputs.version }}"/' screenpipe-app-tauri/src-tauri/Cargo.toml
           fi
 
-      - name: create draft release
-        uses: crabnebula-dev/cloud-release@v0.2.6
-        with:
-          command: release draft ${{ secrets.CN_APP_SLUG }} --framework tauri
-          api-key: ${{ secrets.CN_API_KEY }}
+      - name: Create Draft Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create v${{ github.event.inputs.version || github.ref_name }} \
+            --draft \
+            --title "Release ${{ github.event.inputs.version || github.ref_name }}" \
+            --generate-notes
 
   check_runner:
     runs-on: ubuntu-latest
