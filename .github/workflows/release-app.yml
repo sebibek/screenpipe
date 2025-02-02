@@ -490,7 +490,7 @@ jobs:
         with:
           args: ${{ matrix.tauri-args }}
           projectPath: "./screenpipe-app-tauri"
-          tauriScript: bunx tauri -vvv
+          tauriScript: TAURI_SKIP_CODESIGN=true bunx tauri -vvv
           retryAttempts: 3
 
       - name: Download and Run CLI Manually (Windows)
