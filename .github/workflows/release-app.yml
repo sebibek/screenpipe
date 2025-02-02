@@ -487,10 +487,11 @@ jobs:
           RUSTFLAGS: ${{ matrix.tauri-args == '--target x86_64-pc-windows-msvc' && '-C target-feature=+crt-static -C link-arg=/LTCG' || '' }}
           VCPKG_STATIC_LINKAGE: "true"
           KNF_STATIC_CRT: ${{ matrix.tauri-args == '--target x86_64-pc-windows-msvc' && '1' || '' }}
+          TAURI_SKIP_CODESIGN: true
         with:
           args: ${{ matrix.tauri-args }}
           projectPath: "./screenpipe-app-tauri"
-          tauriScript: TAURI_SKIP_CODESIGN=true bunx tauri -vvv
+          tauriScript: bunx tauri -vvv
           retryAttempts: 3
 
       - name: Download and Run CLI Manually (Windows)
@@ -758,10 +759,11 @@ jobs:
           RUSTFLAGS: ${{ matrix.tauri-args == '--target x86_64-pc-windows-msvc' && '-C target-feature=+crt-static -C link-arg=/LTCG' || '' }}
           VCPKG_STATIC_LINKAGE: "true"
           KNF_STATIC_CRT: ${{ matrix.tauri-args == '--target x86_64-pc-windows-msvc' && '1' || '' }}
+          TAURI_SKIP_CODESIGN: true
         with:
           args: ${{ matrix.tauri-args }}
           projectPath: "./screenpipe-app-tauri"
-          tauriScript: TAURI_SKIP_CODESIGN=true bunx tauri -v
+          tauriScript: bunx tauri -v
 
       - name: Upload Assets to CrabNebula Cloud
         uses: crabnebula-dev/cloud-release@v0.2.6
