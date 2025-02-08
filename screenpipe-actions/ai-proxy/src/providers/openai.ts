@@ -1,7 +1,8 @@
 import { AIProvider } from './base';
-import { Message, RequestBody } from '../types';
+import { Message, RequestBody, ResponseFormat } from '../types';
 import OpenAI from 'openai';
 import type { ChatCompletionMessage, ChatCompletionCreateParams } from 'openai/resources/chat';
+import type { ResponseFormatJSONSchema } from 'openai/resources';
 
 export class OpenAIProvider implements AIProvider {
 	supportsTools = true;
@@ -13,15 +14,44 @@ export class OpenAIProvider implements AIProvider {
 		this.client = new OpenAI({ apiKey });
 	}
 
+	private createJSONSchemaFormat(schema: Record<string, unknown>, name: string, description?: string): ResponseFormatJSONSchema {
+		return {
+			type: 'json_schema',
+			json_schema: {
+				name,
+				description,
+				schema,
+				strict: true,
+			},
+		};
+	}
+
+	private formatResponseFormat(format?: ResponseFormat): ChatCompletionCreateParams['response_format'] {
+		if (!format) return undefined;
+
+		switch (format.type) {
+			case 'json_object':
+				return { type: 'json_object' };
+			case 'json_schema':
+				if (!format.schema || !format.name) {
+					throw new Error('Schema and name are required for json_schema response format');
+				}
+				return this.createJSONSchemaFormat(format.schema, format.name, format.description);
+			default:
+				return undefined;
+		}
+	}
+
 	async createCompletion(body: RequestBody): Promise<Response> {
 		const messages = this.formatMessages(body.messages);
+		const responseFormat = this.formatResponseFormat(body.response_format);
 
 		const params: ChatCompletionCreateParams = {
 			model: body.model,
 			messages,
 			temperature: body.temperature,
 			stream: false,
-			response_format: body.response_format?.type === 'json_object' ? { type: 'json_object' } : undefined,
+			response_format: responseFormat,
 			tools: body.tools as ChatCompletionCreateParams['tools'],
 			tool_choice: body.tool_choice as ChatCompletionCreateParams['tool_choice'],
 		};
@@ -38,7 +68,19 @@ export class OpenAIProvider implements AIProvider {
 			messages: this.formatMessages(body.messages),
 			temperature: body.temperature,
 			stream: true,
-			response_format: body.response_format?.type === 'json_object' ? { type: 'json_object' } : undefined,
+			response_format:
+				body.response_format?.type === 'json_object'
+					? { type: 'json_object' }
+					: body.response_format?.type === 'json_schema'
+					? {
+							type: 'json_schema',
+							json_schema: {
+								schema: body.response_format.schema!,
+								name: body.response_format.name || 'default',
+								strict: true,
+							},
+					  }
+					: undefined,
 			tools: body.tools as ChatCompletionCreateParams['tools'],
 		});
 
@@ -104,5 +146,33 @@ export class OpenAIProvider implements AIProvider {
 				},
 			],
 		};
+	}
+
+	async listModels(): Promise<{ id: string; name: string; provider: string }[]> {
+		try {
+			const response = await this.client.models.list();
+			const sixMonthsAgo = new Date();
+			sixMonthsAgo.setMonth(sixMonthsAgo.getMonth() - 6);
+
+			return response.data
+				.filter((model) => {
+					// Filter out non-LLM models
+					const isNonLLM =
+						model.id.includes('dall-e') || model.id.includes('whisper') || model.id.includes('tts') || model.id.includes('embedding');
+					if (isNonLLM) return false;
+
+					// Check if model is recent (created within last 6 months)
+					const createdAt = new Date(model.created * 1000); // Convert Unix timestamp to Date
+					return createdAt > sixMonthsAgo;
+				})
+				.map((model) => ({
+					id: model.id,
+					name: model.id,
+					provider: 'openai',
+				}));
+		} catch (error) {
+			console.error('Failed to fetch OpenAI models:', error);
+			return [];
+		}
 	}
 }

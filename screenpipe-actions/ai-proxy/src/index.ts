@@ -3,7 +3,7 @@ import { verifyToken } from '@clerk/backend';
 import { createProvider } from './providers';
 import { Env, RequestBody } from './types';
 import * as Sentry from '@sentry/cloudflare';
-import { Deepgram, LiveClient } from '@deepgram/sdk';
+import { Deepgram, DeepgramClient, LiveClient } from '@deepgram/sdk';
 import { createClient, LiveTranscriptionEvents } from '@deepgram/sdk';
 
 // Add cache for subscription status
@@ -205,14 +205,32 @@ async function handleWebSocketUpgrade(request: Request, env: Env): Promise<Respo
 			url.searchParams.set(key, value);
 		}
 
-		const deepgram = createClient(env.DEEPGRAM_API_KEY);
-		const deepgramSocket = deepgram.listen.live({}, url.toString());
+		let deepgram: DeepgramClient | null = null;
+		try {
+			deepgram = createClient(env.DEEPGRAM_API_KEY);
+		} catch (error: any) {
+			console.error('Error creating Deepgram client:', error);
+			return new Response(`Deepgram client creation failed: ${error.message}`, { status: 500 });
+		}
 
-		deepgramSocket.on(LiveTranscriptionEvents.Open, (data) => {
+		if (!deepgram) {
+			return new Response('Deepgram client creation failed', { status: 500 });
+		}
+
+		let deepgramSocket: LiveClient;
+
+		try {
+			deepgramSocket = deepgram.listen.live({}, url.toString());
+		} catch (error: any) {
+			console.error('Error creating Deepgram socket:', error);
+			return new Response(`Deepgram socket creation failed: ${error.message}`, { status: 500 });
+		}
+
+		deepgramSocket.on(LiveTranscriptionEvents.Open, () => {
 			server.send(
 				JSON.stringify({
-					type: 'message',
-					data: JSON.stringify(data),
+					type: 'connected',
+					message: 'WebSocket connection established',
 				})
 			);
 		});
@@ -322,6 +340,12 @@ export default Sentry.withSentry(
 			try {
 				const url = new URL(request.url);
 				const path = url.pathname;
+
+				const upgradeHeader = request.headers.get('upgrade')?.toLowerCase();
+				if (path === '/v1/listen' && upgradeHeader === 'websocket') {
+					console.log('websocket request to /v1/listen detected, bypassing auth');
+					return await handleWebSocketUpgrade(request, env);
+				}
 
 				// Add auth check for protected routes
 				if (path !== '/test') {
@@ -484,9 +508,60 @@ export default Sentry.withSentry(
 					}
 				}
 
-				if (path === '/v1/listen' && request.headers.get('Upgrade') === 'websocket') {
-					console.log('websocket request');
-					return await handleWebSocketUpgrade(request, env);
+				if (path === '/v1/models' && request.method === 'GET') {
+					try {
+						// Create instances of all providers
+						const providers = {
+							anthropic: createProvider('claude-3-5-sonnet-latest', env),
+							openai: createProvider('gpt-4', env),
+							gemini: createProvider('gemini-1.5-pro', env),
+						};
+
+						// Fetch models from all providers in parallel
+						const results = await Promise.allSettled([
+							providers.anthropic.listModels(),
+							providers.openai.listModels(),
+							providers.gemini.listModels(),
+						]);
+
+						// Combine and filter out failed requests
+						const models = results
+							.filter(
+								(result): result is PromiseFulfilledResult<{ id: string; name: string; provider: string }[]> =>
+									result.status === 'fulfilled'
+							)
+							.flatMap((result) => result.value);
+
+						const response = new Response(JSON.stringify({ models }), {
+							headers: {
+								'Access-Control-Allow-Origin': '*',
+								'Access-Control-Allow-Methods': 'GET, HEAD, POST, OPTIONS',
+								'Access-Control-Allow-Headers': '*',
+								'Content-Type': 'application/json',
+							},
+						});
+						response.headers.append('Vary', 'Origin');
+						return response;
+					} catch (error) {
+						console.error('Error fetching models:', error);
+						const response = new Response(
+							JSON.stringify({
+								error: 'Failed to fetch models',
+								details: error instanceof Error ? error.message : 'Unknown error',
+							}),
+							{
+								status: 500,
+								headers: {
+									'Access-Control-Allow-Origin': '*',
+									'Access-Control-Allow-Methods': 'GET, HEAD, POST, OPTIONS',
+									'Access-Control-Allow-Headers': '*',
+									'Content-Type': 'application/json',
+								},
+							}
+						);
+						response.headers.append('Vary', 'Origin');
+						return response;
+					}
 				}
 
 				const response = new Response('not found', {
@@ -531,6 +606,9 @@ terminal 2
 HOST=https://ai-proxy.i-f9f.workers.dev
 HOST=http://localhost:8787
 TOKEN=foobar (check app settings)
+in 
+less "$HOME/Library/Application Support/screenpipe/store.bin"
+
 
 curl $HOST/test
 

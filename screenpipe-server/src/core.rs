@@ -4,22 +4,24 @@ use crate::{DatabaseManager, VideoCapture};
 use anyhow::Result;
 use futures::future::join_all;
 use futures::StreamExt;
-use log::{debug, error, info, warn};
-use screenpipe_audio::realtime::RealtimeTranscriptionEvent;
 use screenpipe_audio::{
     record_and_transcribe, AudioInput, AudioTranscriptionEngine, TranscriptionResult,
 };
 use screenpipe_audio::{start_realtime_recording, AudioStream};
 use screenpipe_core::pii_removal::remove_pii;
 use screenpipe_core::{AudioDevice, DeviceManager, DeviceType, Language};
-use screenpipe_vision::core::{RealtimeVisionEvent, WindowOcr};
-use screenpipe_vision::OcrEngine;
+use screenpipe_events::{poll_meetings_events, send_event};
+use screenpipe_vision::core::WindowOcr;
+use screenpipe_vision::{CaptureResult, OcrEngine};
 use std::collections::HashMap;
+use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::Weak;
 use std::time::Duration;
 use tokio::runtime::Handle;
 use tokio::task::JoinHandle;
+use tracing::{debug, error, info, instrument, warn};
 
 #[derive(Clone)]
 pub struct RecordingConfig {
@@ -29,7 +31,7 @@ pub struct RecordingConfig {
     pub video_chunk_duration: Duration,
     pub use_pii_removal: bool,
     pub capture_unfocused_windows: bool,
-    pub languages: Vec<Language>,
+    pub languages: Arc<Vec<Language>>,
 }
 
 #[derive(Clone)]
@@ -49,14 +51,8 @@ pub struct AudioConfig {
 pub struct VisionConfig {
     pub disabled: bool,
     pub ocr_engine: Arc<OcrEngine>,
-    pub ignored_windows: Vec<String>,
-    pub include_windows: Vec<String>,
-}
-
-#[derive(Clone)]
-pub struct RealtimeConfig {
-    pub transcription_sender: Arc<tokio::sync::broadcast::Sender<RealtimeTranscriptionEvent>>,
-    pub vision_sender: Arc<tokio::sync::broadcast::Sender<RealtimeVisionEvent>>,
+    pub ignored_windows: Arc<Vec<String>>,
+    pub include_windows: Arc<Vec<String>>,
 }
 
 #[derive(Clone)]
@@ -64,23 +60,22 @@ pub struct VideoRecordingConfig {
     pub db: Arc<DatabaseManager>,
     pub output_path: Arc<String>,
     pub fps: f64,
-    pub ocr_engine: Arc<OcrEngine>,
+    pub ocr_engine: Weak<OcrEngine>,
     pub monitor_id: u32,
     pub use_pii_removal: bool,
-    pub ignored_windows: Vec<String>,
-    pub include_windows: Vec<String>,
+    pub ignored_windows: Arc<Vec<String>>,
+    pub include_windows: Arc<Vec<String>>,
     pub video_chunk_duration: Duration,
-    pub languages: Vec<Language>,
+    pub languages: Arc<Vec<Language>>,
     pub capture_unfocused_windows: bool,
-    pub realtime_vision_sender: Arc<tokio::sync::broadcast::Sender<RealtimeVisionEvent>>,
 }
 
+#[instrument(skip(device_manager, db, recording, audio, vision))]
 pub async fn start_continuous_recording(
     db: Arc<DatabaseManager>,
     recording: RecordingConfig,
     audio: AudioConfig,
     vision: VisionConfig,
-    realtime: RealtimeConfig,
     vision_handle: &Handle,
     audio_handle: &Handle,
     device_manager: Arc<DeviceManager>,
@@ -104,7 +99,6 @@ pub async fn start_continuous_recording(
                 recording_config.fps,
                 languages_clone,
                 recording_config.capture_unfocused_windows,
-                realtime.vision_sender,
                 vision.ignored_windows,
                 vision.include_windows,
                 recording_config.video_chunk_duration,
@@ -123,6 +117,10 @@ pub async fn start_continuous_recording(
     let whisper_receiver_clone = audio.whisper_receiver.clone();
     let db_manager_audio = Arc::clone(&db);
 
+    tokio::spawn(async move {
+        let _ = poll_meetings_events().await;
+    });
+
     let audio_task = if !audio.disabled {
         audio_handle.spawn(async move {
             record_audio(
@@ -135,7 +133,6 @@ pub async fn start_continuous_recording(
                 audio.realtime_enabled,
                 audio.realtime_devices,
                 recording_config.languages,
-                realtime.transcription_sender,
                 audio.deepgram_api_key,
             )
             .await
@@ -165,26 +162,39 @@ pub async fn start_continuous_recording(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn record_vision(
     device_manager: Arc<DeviceManager>,
     ocr_engine: Arc<OcrEngine>,
     db: Arc<DatabaseManager>,
     output_path: Arc<String>,
     fps: f64,
-    languages: Vec<Language>,
+    languages: Arc<Vec<Language>>,
     capture_unfocused_windows: bool,
-    realtime_vision_sender: Arc<tokio::sync::broadcast::Sender<RealtimeVisionEvent>>,
-    ignored_windows: Vec<String>,
-    include_windows: Vec<String>,
+    ignored_windows: Arc<Vec<String>>,
+    include_windows: Arc<Vec<String>>,
     video_chunk_duration: Duration,
     use_pii_removal: bool,
 ) -> Result<()> {
     let mut handles: HashMap<u32, JoinHandle<()>> = HashMap::new();
     let mut device_states = device_manager.watch_devices().await;
 
+    // Create weak reference to device_manager
+    let device_manager_weak = Arc::downgrade(&device_manager);
+
     loop {
         tokio::select! {
             Some(state_change) = device_states.next() => {
+                // Clean up finished handles first
+                handles.retain(|monitor_id, handle| {
+                    if handle.is_finished() {
+                        info!("handle for monitor {} has finished", monitor_id);
+                        false
+                    } else {
+                        true
+                    }
+                });
+
                 match DeviceType::from_str(&state_change.device) {
                     Ok(DeviceType::Vision(monitor_id)) => {
                         debug!("record_vision: vision state change: {:?}", state_change);
@@ -196,7 +206,6 @@ async fn record_vision(
                             continue;
                         }
 
-
                         if handles.contains_key(&monitor_id) {
                             continue;
                         }
@@ -205,29 +214,38 @@ async fn record_vision(
 
                         let db_manager_video = Arc::clone(&db);
                         let output_path_video = Arc::clone(&output_path);
-                        let ocr_engine = Arc::clone(&ocr_engine);
-                        let ignored_windows_video = ignored_windows.to_vec();
-                        let include_windows_video = include_windows.to_vec();
-                        let realtime_vision_sender_clone = realtime_vision_sender.clone();
+                        let ocr_engine_weak = Arc::downgrade(&ocr_engine);
+
                         let languages = languages.clone();
-                        let device_manager_vision_clone = device_manager.clone();
+                        // Use weak reference for the device manager
+                        let device_manager_weak = device_manager_weak.clone();
+                        let ignored_windows = ignored_windows.clone();
+                        let include_windows = include_windows.clone();
                         let handle = tokio::spawn(async move {
                             let config = VideoRecordingConfig {
                                 db: db_manager_video,
                                 output_path: output_path_video,
                                 fps,
-                                ocr_engine,
+                                ocr_engine: ocr_engine_weak,
                                 monitor_id,
                                 use_pii_removal,
-                                ignored_windows: ignored_windows_video,
-                                include_windows: include_windows_video,
+                                ignored_windows,
+                                include_windows,
                                 video_chunk_duration,
                                 languages,
                                 capture_unfocused_windows,
-                                realtime_vision_sender: realtime_vision_sender_clone,
                             };
 
-                            if let Err(e) = record_video(device_manager_vision_clone, config).await {
+                            // Upgrade weak reference when needed
+                            let device_manager = match device_manager_weak.upgrade() {
+                                Some(dm) => dm,
+                                None => {
+                                    warn!("device manager no longer exists");
+                                    return;
+                                }
+                            };
+
+                            if let Err(e) = record_video(device_manager, config).await {
                                 error!(
                                     "Error in video recording thread for monitor {}: {}",
                                     monitor_id, e
@@ -244,15 +262,6 @@ async fn record_vision(
 
             }
         }
-
-        handles.retain(|monitor_id, handle| {
-            if handle.is_finished() {
-                info!("handle for monitor {} has finished", monitor_id);
-                false
-            } else {
-                true
-            }
-        });
     }
 }
 
@@ -288,7 +297,7 @@ async fn record_video(
         config.fps,
         config.video_chunk_duration,
         new_chunk_callback,
-        Arc::clone(&config.ocr_engine),
+        config.ocr_engine.clone(),
         config.monitor_id,
         config.ignored_windows,
         config.include_windows,
@@ -314,66 +323,93 @@ async fn record_video(
                     _ => continue, // Ignore other devices or monitors
                 }
             }
-            _ = tokio::time::sleep(Duration::from_secs_f64(1.0 / config.fps)) => {
-                if let Some(frame) = video_capture.ocr_frame_queue.pop() {
-                    for window_result in &frame.window_ocr_results {
-                        match config.db.insert_frame(&device_name, None).await {
-                            Ok(frame_id) => {
-                                let text_json =
-                                    serde_json::to_string(&window_result.text_json).unwrap_or_default();
+            // we should process faster than the fps we use to do OCR
+            _ = tokio::time::sleep(Duration::from_secs_f64(1.0 / (config.fps * 2.0))) => {
+                let frame = match video_capture.ocr_frame_queue.pop() {
+                    Some(f) => f,
+                    None => continue,
+                };
 
-                                let text = if config.use_pii_removal {
-                                    &remove_pii(&window_result.text)
-                                } else {
-                                    &window_result.text
-                                };
-
-                                let _ = config.realtime_vision_sender.send(RealtimeVisionEvent::Ocr(
-                                    WindowOcr {
-                                        image: Some(frame.image.clone()),
-                                        text: text.clone(),
-                                        text_json: window_result.text_json.clone(),
-                                        app_name: window_result.app_name.clone(),
-                                        window_name: window_result.window_name.clone(),
-                                        focused: window_result.focused,
-                                        confidence: window_result.confidence,
-                                        timestamp: frame.timestamp,
-                                    },
-                                ));
-
-                                if let Err(e) = config
-                                    .db
-                                    .insert_ocr_text(
-                                        frame_id,
-                                        text,
-                                        &text_json,
-                                        &window_result.app_name,
-                                        &window_result.window_name,
-                                        Arc::clone(&config.ocr_engine),
-                                        window_result.focused,
-                                    )
-                                    .await
-                                {
-                                    error!(
-                                        "Failed to insert OCR text: {}, skipping window {} of frame {}",
-                                        e, window_result.window_name, frame_id
-                                    );
-                                    continue;
-                                }
-                            }
-                            Err(e) => {
-                                warn!("Failed to insert frame: {}", e);
-                                tokio::time::sleep(Duration::from_millis(100)).await;
-                                continue;
-                            }
-                        }
-                    }
-                }
+                process_ocr_frame(
+                    frame,
+                    &config.db,
+                    &device_name,
+                    config.use_pii_removal,
+                    config.ocr_engine.clone(),
+                ).await;
             }
         }
     }
 }
 
+async fn process_ocr_frame(
+    frame: Arc<CaptureResult>,
+    db: &DatabaseManager,
+    device_name: &str,
+    use_pii_removal: bool,
+    ocr_engine: Weak<OcrEngine>,
+) {
+    let ocr_engine = match ocr_engine.upgrade() {
+        Some(engine) => engine,
+        None => {
+            warn!("OCR engine no longer exists");
+            return;
+        }
+    };
+
+    for window_result in &frame.window_ocr_results {
+        let frame_id = match db.insert_frame(device_name, None).await {
+            Ok(id) => id,
+            Err(e) => {
+                warn!("Failed to insert frame: {}", e);
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+        };
+
+        let text_json = serde_json::to_string(&window_result.text_json).unwrap_or_default();
+
+        let text = if use_pii_removal {
+            remove_pii(&window_result.text)
+        } else {
+            window_result.text.clone()
+        };
+
+        let _ = send_event(
+            "ocr_result",
+            WindowOcr {
+                image: Some(frame.image.clone()),
+                text: text.clone(),
+                text_json: window_result.text_json.clone(),
+                app_name: window_result.app_name.clone(),
+                window_name: window_result.window_name.clone(),
+                focused: window_result.focused,
+                confidence: window_result.confidence,
+                timestamp: frame.timestamp,
+            },
+        );
+
+        if let Err(e) = db
+            .insert_ocr_text(
+                frame_id,
+                &text,
+                &text_json,
+                &window_result.app_name,
+                &window_result.window_name,
+                ocr_engine.clone(),
+                window_result.focused,
+            )
+            .await
+        {
+            error!(
+                "Failed to insert OCR text: {}, skipping window {} of frame {}",
+                e, window_result.window_name, frame_id
+            );
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn record_audio(
     device_manager: Arc<DeviceManager>,
     db: Arc<DatabaseManager>,
@@ -383,19 +419,30 @@ async fn record_audio(
     audio_transcription_engine: Arc<AudioTranscriptionEngine>,
     realtime_audio_enabled: bool,
     realtime_audio_devices: Vec<Arc<AudioDevice>>,
-    languages: Vec<Language>,
-    realtime_transcription_sender: Arc<tokio::sync::broadcast::Sender<RealtimeTranscriptionEvent>>,
+    languages: Arc<Vec<Language>>,
     deepgram_api_key: Option<String>,
 ) -> Result<()> {
     let mut handles: HashMap<String, JoinHandle<()>> = HashMap::new();
     let mut device_states = device_manager.watch_devices().await;
-    let mut previous_transcript = "".to_string();
+    let mut previous_transcript = String::new();
     let mut previous_transcript_id: Option<i64> = None;
-    let realtime_transcription_sender_clone = realtime_transcription_sender.clone();
+
+    // Create a weak reference to device_manager
+    let device_manager_weak = Arc::downgrade(&device_manager);
 
     loop {
         tokio::select! {
             Some(state_change) = device_states.next() => {
+                // Handle cleanup of finished handles
+                handles.retain(|device_id, handle| {
+                    if handle.is_finished() {
+                        info!("handle for device {} has finished", device_id);
+                        false
+                    } else {
+                        true
+                    }
+                });
+
                 match DeviceType::from_str(&state_change.device) {
                     Ok(DeviceType::Audio(audio_device)) => {
                         let device_id = audio_device.to_string();
@@ -414,115 +461,110 @@ async fn record_audio(
 
                         info!("starting audio capture thread for device: {}", &audio_device);
 
-                        let whisper_sender_clone = whisper_sender.clone();
-
                         let audio_device = Arc::new(audio_device);
+                        let is_running = Arc::new(AtomicBool::new(true));
 
-                        let realtime_audio_devices_clone = realtime_audio_devices.clone();
-                        let languages_clone = languages.clone();
-                        let realtime_transcription_sender_clone =
-                            realtime_transcription_sender_clone.clone();
-                        let deepgram_api_key_clone = deepgram_api_key.clone();
-                        let device_receiver_clone = device_manager.clone();
-                        let device_receiver_clone_clone = device_receiver_clone.clone();
-                        let handle = tokio::spawn(async move {
-                            info!(
-                                "starting audio capture thread for device: {}",
-                                &audio_device
-                            );
+                        // Use weak reference for the spawned task
+                        let device_manager_weak = device_manager_weak.clone();
+                        let whisper_sender = whisper_sender.clone();
+                        let languages = Arc::clone(&languages);
+                        let deepgram_api_key = deepgram_api_key.clone();
 
-                            let mut did_warn = false;
+                        let handle = tokio::spawn({
+                            let audio_device = Arc::clone(&audio_device);
+                            let is_running = Arc::clone(&is_running);
+                            let realtime_devices = realtime_audio_devices.iter()
+                                .map(Arc::clone)
+                                .collect::<Vec<_>>();
 
-                            let audio_device_clone = Arc::clone(&audio_device);
-                            let deepgram_api_key = deepgram_api_key_clone.clone();
-                            let is_running = Arc::new(AtomicBool::new(state_change.control.is_running));
+                            async move {
+                                info!("starting audio capture thread for device: {}", &audio_device);
+                                let mut did_warn = false;
 
-                            while is_running.load(Ordering::Relaxed) {
-                                let is_running_clone = is_running.clone();
-                                let device_receiver_monitor = device_receiver_clone_clone.clone();
-                                let device_id = audio_device_clone.to_string();
+                                while is_running.load(Ordering::Relaxed) {
+                                    let device_id = audio_device.to_string();
 
-                                // Monitor device state changes
-                                let mut device_states = device_receiver_monitor.watch_devices().await;
-                                tokio::spawn(async move {
-                                    while let Some(state_change) = device_states.next().await {
-                                        if state_change.device == device_id && !state_change.control.is_running {
-                                            is_running_clone.store(false, Ordering::Relaxed);
+                                    // Upgrade weak reference when needed
+                                    let device_manager = match device_manager_weak.upgrade() {
+                                        Some(dm) => dm,
+                                        None => {
+                                            warn!("device manager no longer exists");
                                             break;
                                         }
-                                    }
-                                });
+                                    };
 
-                                let deepgram_api_key = deepgram_api_key.clone();
-                                let is_running_loop = Arc::clone(&is_running);
-                                let audio_stream = match AudioStream::from_device(
-                                    audio_device_clone.clone(),
-                                    Arc::clone(&is_running_loop),
-                                )
-                                .await
-                                {
-                                    Ok(stream) => stream,
-                                    Err(e) => {
-                                        if e.to_string().contains("audio device not found") {
-                                            if !did_warn {
-                                                warn!("audio device not found: {}", audio_device.name);
-                                                did_warn = true;
+                                    // Monitor device state changes
+                                    let mut device_states = device_manager.watch_devices().await;
+                                    let is_running_clone = Arc::clone(&is_running);
+
+                                    tokio::spawn(async move {
+                                        while let Some(state_change) = device_states.next().await {
+                                            if state_change.device == device_id && !state_change.control.is_running {
+                                                is_running_clone.store(false, Ordering::Relaxed);
+                                                break;
                                             }
-                                            tokio::time::sleep(Duration::from_secs(1)).await;
-                                            continue;
-                                        } else {
-                                            error!("failed to create audio stream: {}", e);
-                                            return;
                                         }
+                                    });
+
+                                    let audio_stream = match AudioStream::from_device(
+                                        Arc::clone(&audio_device),
+                                        Arc::clone(&is_running),
+                                    ).await {
+                                        Ok(stream) => Arc::new(stream),
+                                        Err(e) => {
+                                            if e.to_string().contains("audio device not found") {
+                                                if !did_warn {
+                                                    warn!("audio device not found: {}", audio_device.name);
+                                                    did_warn = true;
+                                                }
+                                                tokio::time::sleep(Duration::from_secs(1)).await;
+                                                continue;
+                                            } else {
+                                                error!("failed to create audio stream: {}", e);
+                                                return;
+                                            }
+                                        }
+                                    };
+
+                                    let mut recording_handles = vec![];
+
+                                    // Spawn record and transcribe task
+                                    recording_handles.push(tokio::spawn({
+                                        let audio_stream = Arc::clone(&audio_stream);
+                                        let is_running = Arc::clone(&is_running);
+                                        let whisper_sender = whisper_sender.clone();
+
+                                        async move {
+                                            let _ = record_and_transcribe(
+                                                audio_stream,
+                                                chunk_duration,
+                                                whisper_sender,
+                                                is_running,
+                                            ).await;
+                                        }
+                                    }));
+
+                                    // Spawn realtime recording task if enabled
+                                    if realtime_audio_enabled && realtime_devices.contains(&audio_device) {
+                                        recording_handles.push(tokio::spawn({
+                                            let audio_stream = Arc::clone(&audio_stream);
+                                            let is_running = Arc::clone(&is_running);
+                                            let languages = Arc::clone(&languages);
+                                            let deepgram_api_key = deepgram_api_key.clone();
+
+                                            async move {
+                                                let _ = start_realtime_recording(
+                                                    audio_stream,
+                                                    languages,
+                                                    is_running,
+                                                    deepgram_api_key,
+                                                ).await;
+                                            }
+                                        }));
                                     }
-                                };
 
-                                let mut recording_handles: Vec<JoinHandle<()>> = vec![];
-
-                                let audio_stream = Arc::new(audio_stream);
-                                let whisper_sender_clone = whisper_sender_clone.clone();
-                                let audio_stream_clone = audio_stream.clone();
-                                let is_running_loop_clone = is_running_loop.clone();
-                                let record_handle = Some(tokio::spawn(async move {
-                                    let _ = record_and_transcribe(
-                                        audio_stream,
-                                        chunk_duration,
-                                        whisper_sender_clone.clone(),
-                                        is_running_loop_clone.clone(),
-                                    )
-                                    .await;
-                                }));
-
-                                if let Some(handle) = record_handle {
-                                    recording_handles.push(handle);
+                                    join_all(recording_handles).await;
                                 }
-
-                                let audio_device_clone = audio_device_clone.clone();
-                                let realtime_audio_devices_clone = realtime_audio_devices_clone.clone();
-                                let languages_clone = languages_clone.clone();
-                                let is_running_loop = is_running_loop.clone();
-                                let realtime_transcription_sender_clone =
-                                    realtime_transcription_sender_clone.clone();
-                                let live_transcription_handle = Some(tokio::spawn(async move {
-                                    if realtime_audio_enabled
-                                        && realtime_audio_devices_clone.contains(&audio_device_clone)
-                                    {
-                                        let _ = start_realtime_recording(
-                                            audio_stream_clone,
-                                            languages_clone.clone(),
-                                            is_running_loop.clone(),
-                                            realtime_transcription_sender_clone.clone(),
-                                            deepgram_api_key.clone(),
-                                        )
-                                        .await;
-                                    }
-                                }));
-
-                                if let Some(handle) = live_transcription_handle {
-                                    recording_handles.push(handle);
-                                }
-
-                                join_all(recording_handles).await;
                             }
                         });
 
@@ -531,19 +573,8 @@ async fn record_audio(
                     _ => continue,
                 }
             }
-            _ = tokio::time::sleep(Duration::from_millis(100)) => {
-
-            }
+            _ = tokio::time::sleep(Duration::from_millis(100)) => {}
         }
-        // Handle cleanup of finished handles
-        handles.retain(|device_id, handle| {
-            if handle.is_finished() {
-                info!("handle for device {} has finished", device_id);
-                false
-            } else {
-                true
-            }
-        });
 
         // Process transcription results
         while let Ok(mut transcription) = whisper_receiver.try_recv() {
@@ -552,42 +583,40 @@ async fn record_audio(
                 transcription.input.device, transcription.transcription
             );
 
-            // Insert the new transcript after fetching
-            let mut current_transcript: Option<String> = transcription.transcription.clone();
-            let mut processed_previous: Option<String> = None;
-            if let Some((previous, current)) =
-                transcription.cleanup_overlap(previous_transcript.clone())
-            {
+            let mut current_transcript = transcription.transcription.clone();
+            let mut processed_previous = None;
+
+            if let Some((previous, current)) = transcription.cleanup_overlap(&previous_transcript) {
                 if !previous.is_empty() && !current.is_empty() {
                     if previous != previous_transcript {
                         processed_previous = Some(previous);
                     }
-                    if current_transcript.is_some()
-                        && current != current_transcript.clone().unwrap_or_default()
-                    {
+                    if current_transcript.as_ref() != Some(&current) {
                         current_transcript = Some(current);
                     }
                 }
             }
 
             transcription.transcription = current_transcript.clone();
-            if current_transcript.is_some() {
-                previous_transcript = current_transcript.unwrap();
+
+            if let Some(transcript) = current_transcript {
+                previous_transcript = transcript;
             } else {
                 continue;
             }
+
             // Process the audio result
             match process_audio_result(
                 &db,
                 transcription,
-                audio_transcription_engine.clone(),
+                Arc::clone(&audio_transcription_engine),
                 processed_previous,
                 previous_transcript_id,
             )
             .await
             {
-                Err(e) => error!("error processing audio result: {}", e),
                 Ok(id) => previous_transcript_id = id,
+                Err(e) => error!("error processing audio result: {}", e),
             }
         }
     }

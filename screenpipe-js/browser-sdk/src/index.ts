@@ -1,4 +1,5 @@
 import type {
+  EventStreamResponse,
   InputAction,
   InputControlResponse,
   NotificationOptions,
@@ -11,6 +12,43 @@ import type {
 } from "../../common/types";
 import { toSnakeCase, convertToCamelCase } from "../../common/utils";
 import { captureEvent, captureMainFeatureEvent } from "../../common/analytics";
+import { PipesManager } from "../../common/PipesManager";
+
+const WS_URL = "ws://localhost:3030/ws/events";
+
+// At the top of the file, add WebSocket instances
+let wsWithImages: WebSocket | null = null;
+let wsWithoutImages: WebSocket | null = null;
+
+// Update the wsEvents generator to accept includeImages parameter and manage connections
+async function* wsEvents(
+  includeImages: boolean = false
+): AsyncGenerator<EventStreamResponse, void, unknown> {
+  // Reuse existing connection or create new one
+  let ws = includeImages ? wsWithImages : wsWithoutImages;
+
+  if (!ws || ws.readyState === WebSocket.CLOSED) {
+    ws = new WebSocket(`${WS_URL}?images=${includeImages}`);
+    if (includeImages) {
+      wsWithImages = ws;
+    } else {
+      wsWithoutImages = ws;
+    }
+
+    // Wait for connection to establish
+    await new Promise((resolve, reject) => {
+      ws!.onopen = resolve;
+      ws!.onerror = reject;
+    });
+  }
+
+  while (true) {
+    const event: MessageEvent = await new Promise((resolve) => {
+      ws!.addEventListener("message", (ev: MessageEvent) => resolve(ev));
+    });
+    yield JSON.parse(event.data);
+  }
+}
 
 async function sendInputControl(action: InputAction): Promise<boolean> {
   const apiUrl = "http://localhost:3030";
@@ -42,6 +80,16 @@ export interface BrowserPipe {
     moveMouse: (x: number, y: number) => Promise<boolean>;
     click: (button: "left" | "right" | "middle") => Promise<boolean>;
   };
+  pipes: {
+    list: () => Promise<string[]>;
+    download: (url: string) => Promise<boolean>;
+    enable: (pipeId: string) => Promise<boolean>;
+    disable: (pipeId: string) => Promise<boolean>;
+    update: (
+      pipeId: string,
+      config: { [key: string]: string }
+    ) => Promise<boolean>;
+  };
   streamTranscriptions(): AsyncGenerator<
     TranscriptionStreamResponse,
     void,
@@ -58,6 +106,9 @@ export interface BrowserPipe {
     name: string,
     properties?: Record<string, any>
   ) => Promise<void>;
+  streamEvents(
+    includeImages: boolean
+  ): AsyncGenerator<EventStreamResponse, void, unknown>;
 }
 
 class BrowserPipeImpl implements BrowserPipe {
@@ -225,103 +276,148 @@ class BrowserPipeImpl implements BrowserPipe {
       sendInputControl({ type: "MouseClick", data: button }),
   };
 
+  pipes: {
+    list: () => Promise<string[]>;
+    download: (url: string) => Promise<boolean>;
+    enable: (pipeId: string) => Promise<boolean>;
+    disable: (pipeId: string) => Promise<boolean>;
+    update: (
+      pipeId: string,
+      config: { [key: string]: string }
+    ) => Promise<boolean>;
+  } = {
+    list: async () => {
+      try {
+        const response = await fetch("http://localhost:3030/pipes/list", {
+          method: "GET",
+          headers: { "Content-Type": "application/json" },
+        });
+
+        const data = await response.json();
+        return data.data;
+      } catch (error) {
+        console.error("failed to list pipes:", error);
+        return [];
+      }
+    },
+    download: async (url: string) => {
+      try {
+        const response = await fetch("http://localhost:3030/pipes/download", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            url,
+          }),
+        });
+
+        return response.ok;
+      } catch (error) {
+        console.error("failed to download pipe:", error);
+        return false;
+      }
+    },
+    enable: async (pipeId: string) => {
+      try {
+        const response = await fetch("http://localhost:3030/pipes/enable", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            pipe_id: pipeId,
+          }),
+        });
+
+        return response.ok;
+      } catch (error) {
+        console.error("failed to enable pipe:", error);
+        return false;
+      }
+    },
+    disable: async (pipeId: string) => {
+      try {
+        const response = await fetch("http://localhost:3030/pipes/disable", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            pipe_id: pipeId,
+          }),
+        });
+
+        return response.ok;
+      } catch (error) {
+        console.error("failed to disable pipe:", error);
+        return false;
+      }
+    },
+    update: async (pipeId: string, config: { [key: string]: string }) => {
+      try {
+        const response = await fetch("http://localhost:3030/pipes/update", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            pipe_id: pipeId,
+            config,
+          }),
+        });
+
+        return response.ok;
+      } catch (error) {
+        console.error("failed to update pipe:", error);
+        return false;
+      }
+    },
+  };
+
   async *streamTranscriptions(): AsyncGenerator<
     TranscriptionStreamResponse,
     void,
     unknown
   > {
-    const eventSource = new EventSource(
-      "http://localhost:3030/sse/transcriptions"
-    );
-    const { userId, email } = await this.initAnalyticsIfNeeded();
-
     try {
-      await this.captureEvent("stream_started", {
-        feature: "transcription",
-        distinct_id: userId,
-        email: email,
-      });
-
       while (true) {
-        const chunk: TranscriptionChunk = await new Promise(
-          (resolve, reject) => {
-            eventSource.onmessage = (event) => {
-              if (event.data.trim() === "keep-alive-text") {
-                return;
-              }
-              resolve(JSON.parse(event.data));
-            };
-            eventSource.onerror = (error) => {
-              reject(error);
+        for await (const event of wsEvents()) {
+          if (event.name === "transcription") {
+            let chunk: TranscriptionChunk = event.data as TranscriptionChunk;
+            yield {
+              id: crypto.randomUUID(),
+              object: "text_completion_chunk",
+              created: Date.now(),
+              model: "screenpipe-realtime",
+              choices: [
+                {
+                  text: chunk.transcription,
+                  index: 0,
+                  finish_reason: chunk.is_final ? "stop" : null,
+                },
+              ],
+              metadata: {
+                timestamp: chunk.timestamp,
+                device: chunk.device,
+                isInput: chunk.is_input,
+              },
             };
           }
-        );
-
-        yield {
-          id: crypto.randomUUID(),
-          object: "text_completion_chunk",
-          created: Date.now(),
-          model: "screenpipe-realtime",
-          choices: [
-            {
-              text: chunk.transcription,
-              index: 0,
-              finish_reason: chunk.is_final ? "stop" : null,
-            },
-          ],
-          metadata: {
-            timestamp: chunk.timestamp,
-            device: chunk.device,
-            isInput: chunk.is_input,
-          },
-        };
+        }
       }
-    } finally {
-      await this.captureEvent("stream_ended", {
-        feature: "transcription",
-        distinct_id: userId,
-        email: email,
-      });
-      eventSource.close();
+    } catch (error) {
+      console.error("error streaming transcriptions:", error);
     }
   }
 
   async *streamVision(
     includeImages: boolean = false
   ): AsyncGenerator<VisionStreamResponse, void, unknown> {
-    const eventSource = new EventSource(
-      `http://localhost:3030/sse/vision?images=${includeImages}`
-    );
-    const { userId, email } = await this.initAnalyticsIfNeeded();
     try {
-      await this.captureEvent("stream_started", {
-        feature: "vision",
-        distinct_id: userId,
-        email: email,
-      });
-
-      while (true) {
-        const event: VisionEvent = await new Promise((resolve, reject) => {
-          eventSource.onmessage = (event) => {
-            resolve(JSON.parse(event.data));
+      for await (const event of wsEvents(includeImages)) {
+        if (event.name === "ocr_result" || event.name === "ui_frame") {
+          let data: VisionEvent = event.data as VisionEvent;
+          yield {
+            type: event.name,
+            data,
           };
-          eventSource.onerror = (error) => {
-            reject(error);
-          };
-        });
-
-        yield {
-          type: "vision_stream",
-          data: event,
-        };
+        }
       }
-    } finally {
-      await this.captureEvent("stream_ended", {
-        feature: "vision",
-        distinct_id: userId,
-        email: email,
-      });
-      eventSource.close();
+    } catch (error) {
+      console.error("error streaming vision:", error);
     }
   }
 
@@ -342,10 +438,20 @@ class BrowserPipeImpl implements BrowserPipe {
     if (!analyticsEnabled) return;
     return captureMainFeatureEvent(featureName, properties);
   }
+
+  public async *streamEvents(
+    includeImages: boolean = false
+  ): AsyncGenerator<EventStreamResponse, void, unknown> {
+    for await (const event of wsEvents(includeImages)) {
+      yield event;
+    }
+  }
 }
 
 const pipeImpl = new BrowserPipeImpl();
+const pipeManager = new PipesManager();
 export const pipe = pipeImpl;
+pipeImpl.pipes = pipeManager;
 
 export * from "../../common/types";
 export { getDefaultSettings } from "../../common/utils";

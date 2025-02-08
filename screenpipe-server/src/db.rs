@@ -1,7 +1,6 @@
 use chrono::{DateTime, Utc};
 use image::DynamicImage;
 use libsqlite3_sys::sqlite3_auto_extension;
-use log::{debug, error, warn};
 use screenpipe_core::{AudioDevice, AudioDeviceType};
 use screenpipe_vision::OcrEngine;
 use sqlite_vec::sqlite3_vec_init;
@@ -14,6 +13,7 @@ use sqlx::TypeInfo;
 use sqlx::ValueRef;
 use std::sync::Arc;
 use std::time::Duration;
+use tracing::{debug, error, warn};
 
 use std::collections::BTreeMap;
 use tokio::time::{timeout, Duration as TokioDuration};
@@ -134,11 +134,12 @@ impl DatabaseManager {
         start_time: Option<f64>,
         end_time: Option<f64>,
     ) -> Result<i64, sqlx::Error> {
+        let text_length = transcription.len() as i64;
         let mut tx = self.pool.begin().await?;
 
         // Insert the full transcription
         let id = sqlx::query(
-            "INSERT INTO audio_transcriptions (audio_chunk_id, transcription, offset_index, timestamp, transcription_engine, device, is_input_device, speaker_id, start_time, end_time) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            "INSERT INTO audio_transcriptions (audio_chunk_id, transcription, offset_index, timestamp, transcription_engine, device, is_input_device, speaker_id, start_time, end_time, text_length) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
         )
         .bind(audio_chunk_id)
         .bind(transcription)
@@ -150,6 +151,7 @@ impl DatabaseManager {
         .bind(speaker_id)
         .bind(start_time)
         .bind(end_time)
+        .bind(text_length)
         .execute(&mut *tx)
         .await?
         .last_insert_rowid();
@@ -165,13 +167,15 @@ impl DatabaseManager {
         audio_chunk_id: i64,
         transcription: &str,
     ) -> Result<i64, sqlx::Error> {
+        let text_length = transcription.len() as i64;
         let mut tx = self.pool.begin().await?;
 
         // Insert the full transcription
         let affected = sqlx::query(
-            "UPDATE audio_transcriptions SET transcription = ?1 WHERE audio_chunk_id = ?2",
+            "UPDATE audio_transcriptions SET transcription = ?1, text_length = ?2 WHERE audio_chunk_id = ?3",
         )
         .bind(transcription)
+        .bind(text_length)
         .bind(audio_chunk_id)
         .execute(&mut *tx)
         .await?
@@ -179,7 +183,6 @@ impl DatabaseManager {
 
         // Commit the transaction for the full transcription
         tx.commit().await?;
-
         Ok(affected as i64)
     }
 
@@ -419,6 +422,7 @@ impl DatabaseManager {
         ocr_engine: Arc<OcrEngine>,
         focused: bool,
     ) -> Result<(), sqlx::Error> {
+        let text_length = text.len() as i64;
         let display_window_name = if window_name.chars().count() > 20 {
             format!("{}...", window_name.chars().take(20).collect::<String>())
         } else {
@@ -436,7 +440,7 @@ impl DatabaseManager {
         );
 
         let mut tx = self.pool.begin().await?;
-        sqlx::query("INSERT INTO ocr_text (frame_id, text, text_json, app_name, ocr_engine, window_name, focused) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)")
+        sqlx::query("INSERT INTO ocr_text (frame_id, text, text_json, app_name, ocr_engine, window_name, focused, text_length) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)")
             .bind(frame_id)
             .bind(text)
             .bind(text_json)
@@ -444,6 +448,7 @@ impl DatabaseManager {
             .bind(format!("{:?}", *ocr_engine))
             .bind(window_name)
             .bind(focused)
+            .bind(text_length)
             .execute(&mut *tx)
             .await?;
 
@@ -753,17 +758,16 @@ impl DatabaseManager {
             LEFT JOIN vision_tags ON frames.id = vision_tags.vision_id
             LEFT JOIN tags ON vision_tags.tag_id = tags.id
             {}
-                AND ocr_text.text != 'No text found'
                 AND (?2 IS NULL OR frames.timestamp >= ?2)
                 AND (?3 IS NULL OR frames.timestamp <= ?3)
-                AND (?4 IS NULL OR LENGTH(ocr_text.text) >= ?4)
-                AND (?5 IS NULL OR LENGTH(ocr_text.text) <= ?5)
-                AND (?6 IS NULL OR ocr_text.app_name LIKE '%' || ?6 || '%' COLLATE NOCASE)
-                AND (?7 IS NULL OR ocr_text.window_name LIKE '%' || ?7 || '%' COLLATE NOCASE)
-                AND (?10 IS NULL OR frames.name LIKE '%' || ?10 || '%' COLLATE NOCASE)
+                AND (?4 IS NULL OR ocr_text.app_name LIKE '%' || ?4 || '%')
+                AND (?5 IS NULL OR ocr_text.window_name LIKE '%' || ?5 || '%')
+                AND (?6 IS NULL OR COALESCE(ocr_text.text_length,LENGTH(ocr_text.text)) >= ?6)
+                AND (?7 IS NULL OR COALESCE(ocr_text.text_length,LENGTH(ocr_text.text)) <= ?7)
+                AND (?8 IS NULL OR frames.name LIKE '%' || ?8 || '%' COLLATE NOCASE)
             GROUP BY ocr_text.frame_id
             ORDER BY frames.timestamp DESC
-            LIMIT ?8 OFFSET ?9
+            LIMIT ?9 OFFSET ?10
             "#,
             base_sql, where_clause
         );
@@ -772,13 +776,13 @@ impl DatabaseManager {
             .bind(query)
             .bind(start_time)
             .bind(end_time)
-            .bind(min_length.map(|l| l as i64))
-            .bind(max_length.map(|l| l as i64))
             .bind(app_name)
             .bind(window_name)
+            .bind(min_length.map(|l| l as i64))
+            .bind(max_length.map(|l| l as i64))
+            .bind(frame_name)
             .bind(limit)
             .bind(offset)
-            .bind(frame_name)
             .fetch_all(&self.pool)
             .await?;
 
@@ -857,8 +861,8 @@ impl DatabaseManager {
             {}
                 AND (?2 IS NULL OR audio_transcriptions.timestamp >= ?2)
                 AND (?3 IS NULL OR audio_transcriptions.timestamp <= ?3)
-                AND (?4 IS NULL OR LENGTH(audio_transcriptions.transcription) >= ?4)
-                AND (?5 IS NULL OR LENGTH(audio_transcriptions.transcription) <= ?5)
+                AND (?4 IS NULL OR COALESCE(audio_transcriptions.text_length, LENGTH(audio_transcriptions.transcription)) >= ?4)
+                AND (?5 IS NULL OR COALESCE(audio_transcriptions.text_length, LENGTH(audio_transcriptions.transcription)) <= ?5)
                 AND (speakers.id IS NULL OR speakers.hallucination = 0)
                 AND (json_array_length(?6) = 0 OR audio_transcriptions.speaker_id IN (SELECT value FROM json_each(?6)))
             GROUP BY audio_transcriptions.audio_chunk_id, audio_transcriptions.offset_index
@@ -948,31 +952,48 @@ impl DatabaseManager {
         speaker_ids: Option<Vec<i64>>,
         frame_name: Option<&str>,
     ) -> Result<usize, sqlx::Error> {
-        let mut json_array: String = "[]".to_string();
-        if let Some(ids) = speaker_ids {
+        // binding order:
+        // ?1 = query
+        // ?2 = start_time
+        // ?3 = end_time
+        // ?4 = app_name
+        // ?5 = window_name
+        // ?6 = frame_name (for OCR only)
+        // ?7 = min_length (for text/transcription length)
+        // ?8 = max_length (for text/transcription length)
+        // ?9 = json array for speaker_ids (for audio only)
+        let json_array = if let Some(ids) = speaker_ids {
             if !ids.is_empty() {
-                json_array = serde_json::to_string(&ids).unwrap_or_default();
+                serde_json::to_string(&ids).unwrap_or_default()
+            } else {
+                "[]".to_string()
             }
-        }
+        } else {
+            "[]".to_string()
+        };
 
         let sql = match content_type {
             ContentType::OCR => {
                 format!(
                     r#"
                     SELECT COUNT(DISTINCT frames.id)
-                    FROM ocr_text_fts
-                    JOIN ocr_text ON ocr_text_fts.frame_id = ocr_text.frame_id
+                    FROM {table}
                     JOIN frames ON ocr_text.frame_id = frames.id
-                    WHERE {}
+                    WHERE {match_condition}
                         AND (?2 IS NULL OR frames.timestamp >= ?2)
                         AND (?3 IS NULL OR frames.timestamp <= ?3)
                         AND (?4 IS NULL OR ocr_text.app_name LIKE '%' || ?4 || '%')
                         AND (?5 IS NULL OR ocr_text.window_name LIKE '%' || ?5 || '%')
-                        AND (?6 IS NULL OR LENGTH(ocr_text.text) >= ?6)
-                        AND (?7 IS NULL OR LENGTH(ocr_text.text) <= ?7)
+                        AND (?6 IS NULL OR COALESCE(ocr_text.text_length, LENGTH(ocr_text.text)) >= ?6)
+                        AND (?7 IS NULL OR COALESCE(ocr_text.text_length, LENGTH(ocr_text.text)) <= ?7)
                         AND (?8 IS NULL OR frames.name LIKE '%' || ?8 || '%' COLLATE NOCASE)
                     "#,
-                    if query.is_empty() {
+                    table = if query.is_empty() {
+                        "ocr_text"
+                    } else {
+                        "ocr_text_fts JOIN ocr_text ON ocr_text_fts.frame_id = ocr_text.frame_id"
+                    },
+                    match_condition = if query.is_empty() {
                         "1=1"
                     } else {
                         "ocr_text_fts MATCH ?1"
@@ -983,16 +1004,20 @@ impl DatabaseManager {
                 format!(
                     r#"
                     SELECT COUNT(DISTINCT audio_transcriptions.audio_chunk_id || '_' || COALESCE(audio_transcriptions.start_time, '') || '_' || COALESCE(audio_transcriptions.end_time, ''))
-                    FROM audio_transcriptions_fts
-                    JOIN audio_transcriptions ON audio_transcriptions_fts.audio_chunk_id = audio_transcriptions.audio_chunk_id
-                    WHERE {}
+                    FROM {table}
+                    WHERE {match_condition}
                         AND (?2 IS NULL OR audio_transcriptions.timestamp >= ?2)
                         AND (?3 IS NULL OR audio_transcriptions.timestamp <= ?3)
-                        AND (?6 IS NULL OR LENGTH(audio_transcriptions.transcription) >= ?6)
-                        AND (?7 IS NULL OR LENGTH(audio_transcriptions.transcription) <= ?7)
+                        AND (?6 IS NULL OR COALESCE(audio_transcriptions.text_length, LENGTH(audio_transcriptions.transcription)) >= ?6)
+                        AND (?7 IS NULL OR COALESCE(audio_transcriptions.text_length, LENGTH(audio_transcriptions.transcription)) <= ?7)
                         AND (json_array_length(?8) = 0 OR audio_transcriptions.speaker_id IN (SELECT value FROM json_each(?8)))
                     "#,
-                    if query.is_empty() {
+                    table = if query.is_empty() {
+                        "audio_transcriptions"
+                    } else {
+                        "audio_transcriptions_fts JOIN audio_transcriptions ON audio_transcriptions_fts.audio_chunk_id = audio_transcriptions.audio_chunk_id"
+                    },
+                    match_condition = if query.is_empty() {
                         "1=1"
                     } else {
                         "audio_transcriptions_fts MATCH ?1"
@@ -1003,17 +1028,21 @@ impl DatabaseManager {
                 format!(
                     r#"
                     SELECT COUNT(DISTINCT ui_monitoring.id)
-                    FROM ui_monitoring_fts
-                    JOIN ui_monitoring ON ui_monitoring_fts.ui_id = ui_monitoring.id
-                    WHERE {}
+                    FROM {table}
+                    WHERE {match_condition}
                         AND (?2 IS NULL OR ui_monitoring.timestamp >= ?2)
                         AND (?3 IS NULL OR ui_monitoring.timestamp <= ?3)
                         AND (?4 IS NULL OR ui_monitoring.app LIKE '%' || ?4 || '%')
                         AND (?5 IS NULL OR ui_monitoring.window LIKE '%' || ?5 || '%')
-                        AND (?6 IS NULL OR LENGTH(ui_monitoring.text_output) >= ?6)
-                        AND (?7 IS NULL OR LENGTH(ui_monitoring.text_output) <= ?7)
+                        AND (?6 IS NULL OR COALESCE(ui_monitoring.text_length, LENGTH(ui_monitoring.text_output)) >= ?6)
+                        AND (?7 IS NULL OR COALESCE(ui_monitoring.text_length, LENGTH(ui_monitoring.text_output)) <= ?7)
                     "#,
-                    if query.is_empty() {
+                    table = if query.is_empty() {
+                        "ui_monitoring"
+                    } else {
+                        "ui_monitoring_fts JOIN ui_monitoring ON ui_monitoring_fts.ui_id = ui_monitoring.id"
+                    },
+                    match_condition = if query.is_empty() {
                         "1=1"
                     } else {
                         "ui_monitoring_fts MATCH ?1"
@@ -1024,70 +1053,69 @@ impl DatabaseManager {
                 format!(
                     r#"
                     SELECT COUNT(*) FROM (
+                        -- OCR part
                         SELECT DISTINCT frames.id
-                        FROM {}
+                        FROM {ocr_table}
                         JOIN frames ON ocr_text.frame_id = frames.id
-                        WHERE {}
+                        WHERE {ocr_match}
                             AND (?2 IS NULL OR frames.timestamp >= ?2)
                             AND (?3 IS NULL OR frames.timestamp <= ?3)
                             AND (?4 IS NULL OR ocr_text.app_name LIKE '%' || ?4 || '%')
                             AND (?5 IS NULL OR ocr_text.window_name LIKE '%' || ?5 || '%')
-                            AND (?6 IS NULL OR LENGTH(ocr_text.text) >= ?6)
-                            AND (?7 IS NULL OR LENGTH(ocr_text.text) <= ?7)
+                            AND (?6 IS NULL OR COALESCE(ocr_text.text_length, LENGTH(ocr_text.text)) >= ?6)
+                            AND (?7 IS NULL OR COALESCE(ocr_text.text_length, LENGTH(ocr_text.text)) <= ?7)
                             AND (?8 IS NULL OR frames.name LIKE '%' || ?8 || '%' COLLATE NOCASE)
                             AND ocr_text.text != 'No text found'
-
                         UNION ALL
-
+                        -- Audio part
                         SELECT DISTINCT audio_transcriptions.id
-                        FROM {}
-                        WHERE {}
+                        FROM {audio_table}
+                        WHERE {audio_match}
                             AND (?2 IS NULL OR audio_transcriptions.timestamp >= ?2)
                             AND (?3 IS NULL OR audio_transcriptions.timestamp <= ?3)
-                            AND (?6 IS NULL OR LENGTH(audio_transcriptions.transcription) >= ?6)
-                            AND (?7 IS NULL OR LENGTH(audio_transcriptions.transcription) <= ?7)
+                            AND (?6 IS NULL OR COALESCE(audio_transcriptions.text_length, LENGTH(audio_transcriptions.transcription)) >= ?6)
+                            AND (?7 IS NULL OR COALESCE(audio_transcriptions.text_length, LENGTH(audio_transcriptions.transcription)) <= ?7)
                             AND audio_transcriptions.transcription != ''
-                            AND (json_array_length(?8) = 0 OR audio_transcriptions.speaker_id IN (SELECT value FROM json_each(?8)))
-
+                            AND (json_array_length(?9) = 0 OR audio_transcriptions.speaker_id IN (SELECT value FROM json_each(?9)))
                         UNION ALL
-
+                        -- UI part
                         SELECT DISTINCT ui_monitoring.id
-                        FROM {}
-                        WHERE {}
+                        FROM {ui_table}
+                        WHERE {ui_match}
                             AND (?2 IS NULL OR ui_monitoring.timestamp >= ?2)
                             AND (?3 IS NULL OR ui_monitoring.timestamp <= ?3)
                             AND (?4 IS NULL OR ui_monitoring.app LIKE '%' || ?4 || '%')
                             AND (?5 IS NULL OR ui_monitoring.window LIKE '%' || ?5 || '%')
-                            AND (?6 IS NULL OR LENGTH(ui_monitoring.text_output) >= ?6)
-                            AND (?7 IS NULL OR LENGTH(ui_monitoring.text_output) <= ?7)
+                            AND (?6 IS NULL OR COALESCE(ui_monitoring.text_length, LENGTH(ui_monitoring.text_output)) >= ?6)
+                            AND (?7 IS NULL OR COALESCE(ui_monitoring.text_length, LENGTH(ui_monitoring.text_output)) <= ?7)
                             AND ui_monitoring.text_output != ''
                     )"#,
-                    if query.is_empty() {
+                    ocr_table = if query.is_empty() {
                         "ocr_text"
                     } else {
                         "ocr_text_fts JOIN ocr_text ON ocr_text_fts.frame_id = ocr_text.frame_id"
                     },
-                    if query.is_empty() {
+                    ocr_match = if query.is_empty() {
                         "1=1"
                     } else {
                         "ocr_text_fts MATCH ?1"
                     },
-                    if query.is_empty() {
+                    audio_table = if query.is_empty() {
                         "audio_transcriptions"
                     } else {
-                        "audio_transcriptions_fts JOIN audio_transcriptions ON audio_transcriptions_fts.rowid = audio_transcriptions.id"
+                        "audio_transcriptions_fts JOIN audio_transcriptions ON audio_transcriptions_fts.audio_chunk_id = audio_transcriptions.audio_chunk_id"
                     },
-                    if query.is_empty() {
+                    audio_match = if query.is_empty() {
                         "1=1"
                     } else {
                         "audio_transcriptions_fts MATCH ?1"
                     },
-                    if query.is_empty() {
+                    ui_table = if query.is_empty() {
                         "ui_monitoring"
                     } else {
                         "ui_monitoring_fts JOIN ui_monitoring ON ui_monitoring_fts.ui_id = ui_monitoring.id"
                     },
-                    if query.is_empty() {
+                    ui_match = if query.is_empty() {
                         "1=1"
                     } else {
                         "ui_monitoring_fts MATCH ?1"
@@ -1098,18 +1126,17 @@ impl DatabaseManager {
         };
 
         let count: (i64,) = sqlx::query_as(&sql)
-            .bind(query)
-            .bind(start_time)
-            .bind(end_time)
-            .bind(app_name)
-            .bind(window_name)
-            .bind(frame_name)
-            .bind(min_length.map(|len| len as i64))
-            .bind(max_length.map(|len| len as i64))
-            .bind(json_array)
+            .bind(query) // ?1
+            .bind(start_time) // ?2
+            .bind(end_time) // ?3
+            .bind(app_name) // ?4
+            .bind(window_name) // ?5
+            .bind(frame_name) // ?6
+            .bind(min_length.map(|l| l as i64)) // ?7
+            .bind(max_length.map(|l| l as i64)) // ?8
+            .bind(json_array) // ?9
             .fetch_one(&self.pool)
             .await?;
-
         Ok(count.0 as usize)
     }
 
@@ -1362,113 +1389,6 @@ impl DatabaseManager {
         ))
     }
 
-    // ! TODO: atm not sure what will happen if we have multiple transcriptions, OCR, etc for same timestamp (multi monitor, multi audio device...)
-    // ! just merging
-    // ! the offset is not quite right but we try to index around frames which is the central human experience and most important sense
-    // ! there should be a way to properly sync audio and video indexes
-    //pub async fn find_video_chunks(
-    //    &self,
-    //    start: DateTime<Utc>,
-    //    end: DateTime<Utc>,
-    //) -> Result<TimeSeriesChunk, SqlxError> {
-    //    // First get all frames in time range with their OCR data
-    //    let frames_query = r#"
-    //        SELECT
-    //            f.id,
-    //            f.timestamp,
-    //            f.offset_index,
-    //            ot.text,
-    //            ot.app_name,
-    //            ot.window_name,
-    //            vc.device_name as screen_device,
-    //            vc.file_path as video_path
-    //        FROM frames f
-    //        JOIN video_chunks vc ON f.video_chunk_id = vc.id
-    //        LEFT JOIN ocr_text ot ON f.id = ot.frame_id
-    //        WHERE f.timestamp >= ?1 AND f.timestamp <= ?2
-    //        ORDER BY f.timestamp DESC, f.offset_index DESC
-    //    "#;
-
-    //    // Then get audio data that overlaps with these frames
-    //    let audio_query = r#"
-    //        SELECT
-    //            at.timestamp,
-    //            at.transcription,
-    //            at.device as audio_device,
-    //            at.is_input_device,
-    //            ac.file_path as audio_path
-    //        FROM audio_transcriptions at
-    //        JOIN audio_chunks ac ON at.audio_chunk_id = ac.id
-    //        WHERE at.timestamp >= ?1 AND at.timestamp <= ?2
-    //        ORDER BY at.timestamp DESC
-    //    "#;
-
-    //    // Execute both queries
-    //    let (frame_rows, audio_rows) = tokio::try_join!(
-    //        sqlx::query(frames_query)
-    //            .bind(start)
-    //            .bind(end)
-    //            .fetch_all(&self.pool),
-    //        sqlx::query(audio_query)
-    //            .bind(start)
-    //            .bind(end)
-    //            .fetch_all(&self.pool)
-    //    )?;
-
-    //    // Process into structured data
-    //    let mut frames_map: BTreeMap<(DateTime<Utc>, i64), FrameData> = BTreeMap::new();
-
-    //    // Process frame/OCR data
-    //    for row in frame_rows {
-    //        let timestamp: DateTime<Utc> = row.get("timestamp");
-    //        let offset_index: i64 = row.get("offset_index");
-    //        let key = (timestamp, offset_index);
-
-    //        let frame_data = frames_map.entry(key).or_insert_with(|| FrameData {
-    //            frame_id: row.get("id"),
-    //            timestamp,
-    //            offset_index,
-    //            ocr_entries: Vec::new(),
-    //            audio_entries: Vec::new(),
-    //        });
-
-    //        if let Ok(text) = row.try_get::<String, _>("text") {
-    //            frame_data.ocr_entries.push(OCREntry {
-    //                text,
-    //                app_name: row.get("app_name"),
-    //                window_name: row.get("window_name"),
-    //                device_name: row.get("screen_device"),
-    //                video_file_path: row.get("video_path"),
-    //            });
-    //        }
-    //    }
-
-    //    // Process audio data
-    //    for row in audio_rows {
-    //        let timestamp: DateTime<Utc> = row.get("timestamp");
-
-    //        // Find the closest frame
-    //        if let Some((&key, _)) = frames_map.range(..(timestamp, i64::MAX)).next_back() {
-    //            if let Some(frame_data) = frames_map.get_mut(&key) {
-    //                frame_data.audio_entries.push(AudioEntry {
-    //                    transcription: row.get("transcription"),
-    //                    device_name: row.get("audio_device"),
-    //                    is_input: row.get("is_input_device"),
-    //                    audio_file_path: row.get("audio_path"),
-    //                    // duration_secs: row.get("duration_secs"),
-    //                    duration_secs: 0.0, // TODO
-    //                });
-    //            }
-    //        }
-    //    }
-
-    //    Ok(TimeSeriesChunk {
-    //        frames: frames_map.into_values().rev().collect(),
-    //        start_time: start,
-    //        end_time: end,
-    //    })
-    //}
-
     pub async fn find_video_chunks(
         &self,
         start: DateTime<Utc>,
@@ -1636,7 +1556,7 @@ impl DatabaseManager {
                 AND (?4 IS NULL OR ui_monitoring.app LIKE '%' || ?4 || '%')
                 AND (?5 IS NULL OR ui_monitoring.window LIKE '%' || ?5 || '%')
             ORDER BY ui_monitoring.timestamp DESC
-            LIMIT ?7 OFFSET ?8
+            LIMIT ?6 OFFSET ?7
             "#,
             base_sql, where_clause
         );

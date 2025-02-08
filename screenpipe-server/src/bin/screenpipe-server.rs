@@ -21,7 +21,7 @@ use screenpipe_server::{
         AudioCommand, Cli, CliAudioTranscriptionEngine, CliOcrEngine, Command, OutputFormat,
         PipeCommand, VisionCommand,
     },
-    core::{AudioConfig, RealtimeConfig, RecordingConfig, VisionConfig},
+    core::{AudioConfig, RecordingConfig, VisionConfig},
     handle_index_command,
     pipe_manager::PipeInfo,
     start_continuous_recording, watch_pid, DatabaseManager, PipeManager, ResourceMonitor, Server,
@@ -29,6 +29,7 @@ use screenpipe_server::{
 use screenpipe_vision::monitor::list_monitors;
 #[cfg(target_os = "macos")]
 use screenpipe_vision::run_ui;
+use serde::Deserialize;
 use serde_json::{json, Value};
 use std::{
     collections::{HashMap, HashSet},
@@ -46,7 +47,16 @@ use tracing_appender::non_blocking::WorkerGuard;
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use tracing_subscriber::prelude::__tracing_subscriber_SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
+use tracing_subscriber::Layer;
 use tracing_subscriber::{fmt, EnvFilter};
+
+// Add this struct to handle the server response structure
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct ApiResponse<T> {
+    data: T,
+    success: bool,
+}
 
 const DISPLAY: &str = r"
                                             _          
@@ -83,48 +93,67 @@ fn setup_logging(local_data_dir: &PathBuf, cli: &Cli) -> anyhow::Result<WorkerGu
 
     let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
 
-    let env_filter = EnvFilter::from_default_env()
-        .add_directive("info".parse().unwrap())
-        .add_directive("tokenizers=error".parse().unwrap())
-        .add_directive("rusty_tesseract=error".parse().unwrap())
-        .add_directive("symphonia=error".parse().unwrap())
-        .add_directive("hf_hub=error".parse().unwrap());
+    let make_env_filter = || {
+        let filter = EnvFilter::from_default_env()
+            .add_directive("tokio=debug".parse().unwrap())
+            .add_directive("runtime=debug".parse().unwrap())
+            .add_directive("info".parse().unwrap())
+            .add_directive("tokenizers=error".parse().unwrap())
+            .add_directive("rusty_tesseract=error".parse().unwrap())
+            .add_directive("symphonia=error".parse().unwrap())
+            .add_directive("hf_hub=error".parse().unwrap());
 
-    // filtering out xcap::platform::impl_window - Access is denied. (0x80070005)
-    // which is noise
-    #[cfg(target_os = "windows")]
-    let env_filter = env_filter.add_directive("xcap::platform::impl_window=off".parse().unwrap());
+        // filtering out xcap::platform::impl_window - Access is denied. (0x80070005)
+        // which is noise
+        #[cfg(target_os = "windows")]
+        let filter = filter.add_directive("xcap::platform::impl_window=off".parse().unwrap());
 
-    let env_filter = env::var("SCREENPIPE_LOG")
-        .unwrap_or_default()
-        .split(',')
-        .filter(|s| !s.is_empty())
-        .fold(
-            env_filter,
-            |filter, module_directive| match module_directive.parse() {
-                Ok(directive) => filter.add_directive(directive),
-                Err(e) => {
-                    eprintln!(
-                        "warning: invalid log directive '{}': {}",
-                        module_directive, e
-                    );
-                    filter
+        let filter = env::var("SCREENPIPE_LOG")
+            .unwrap_or_default()
+            .split(',')
+            .filter(|s| !s.is_empty())
+            .fold(filter, |filter, module_directive| {
+                match module_directive.parse() {
+                    Ok(directive) => filter.add_directive(directive),
+                    Err(e) => {
+                        eprintln!(
+                            "warning: invalid log directive '{}': {}",
+                            module_directive, e
+                        );
+                        filter
+                    }
                 }
-            },
-        );
+            });
 
-    let env_filter = if cli.debug {
-        env_filter.add_directive("screenpipe=debug".parse().unwrap())
-    } else {
-        env_filter
+        if cli.debug {
+            filter.add_directive("screenpipe=debug".parse().unwrap())
+        } else {
+            filter
+        }
     };
 
-    tracing_subscriber::registry()
-        .with(env_filter)
-        .with(fmt::layer().with_writer(std::io::stdout))
-        .with(fmt::layer().with_writer(non_blocking))
-        .init();
+    let tracing_registry = tracing_subscriber::registry()
+        .with(
+            fmt::layer()
+                .with_writer(std::io::stdout)
+                .with_filter(make_env_filter()),
+        )
+        .with(
+            fmt::layer()
+                .with_writer(non_blocking)
+                .with_filter(make_env_filter()),
+        );
 
+    #[cfg(feature = "debug-console")]
+    let tracing_registry = tracing_registry.with(
+        console_subscriber::spawn().with_filter(
+            EnvFilter::from_default_env()
+                .add_directive("tokio=trace".parse().unwrap())
+                .add_directive("runtime=trace".parse().unwrap()),
+        ),
+    );
+
+    tracing_registry.init();
     Ok(guard)
 }
 
@@ -157,8 +186,7 @@ async fn main() -> anyhow::Result<()> {
     let local_data_dir = get_base_dir(&cli.data_dir)?;
     let local_data_dir_clone = local_data_dir.clone();
 
-    // Only set up logging if we're not running a pipe command with JSON output
-    let should_log = match &cli.command {
+    match &cli.command {
         Some(Command::Pipe { subcommand }) => {
             matches!(
                 subcommand,
@@ -208,16 +236,12 @@ async fn main() -> anyhow::Result<()> {
     };
 
     // Store the guard in a variable that lives for the entire main function
-    let _log_guard = if should_log {
-        Some(setup_logging(&local_data_dir, &cli)?)
-    } else {
-        None
-    };
+    let _log_guard = Some(setup_logging(&local_data_dir, &cli)?);
 
     let pipe_manager = Arc::new(PipeManager::new(local_data_dir_clone.clone()));
 
     if let Some(Command::Completions { shell }) = &cli.command {
-        cli.handle_completions(shell.clone())?;
+        cli.handle_completions(*shell)?;
         return Ok(());
     }
     if let Some(command) = cli.command {
@@ -425,21 +449,33 @@ async fn main() -> anyhow::Result<()> {
                 handle_doctor_command(output, fix).await?;
                 return Ok(());
             }
+            Command::AddToPath { yes } => {
+                if !yes {
+                    print!("add screenpipe to system PATH? [y/N] ");
+                    std::io::stdout().flush()?;
+                    let mut input = String::new();
+                    std::io::stdin().read_line(&mut input)?;
+                    if !input.trim().eq_ignore_ascii_case("y") {
+                        println!("operation cancelled");
+                        return Ok(());
+                    }
+                }
+
+                match ensure_screenpipe_in_path().await {
+                    Ok(_) => {
+                        println!("✓ screenpipe successfully added to PATH");
+                        println!("note: you may need to restart your terminal for changes to take effect");
+                    }
+                    Err(e) => {
+                        eprintln!("failed to add screenpipe to PATH: {}", e);
+                        return Err(e);
+                    }
+                }
+                return Ok(());
+            }
             Command::Completions { .. } => todo!(),
         }
     }
-
-    // Check if Screenpipe is present in PATH
-    // TODO: likely should not force user to install in PATH (eg brew, powershell, or button in UI)
-    match ensure_screenpipe_in_path().await {
-        Ok(_) => info!("screenpipe is available and properly set in the PATH"),
-        Err(e) => {
-            warn!("screenpipe PATH check failed: {}", e);
-            warn!("please ensure screenpipe is installed correctly and is in your PATH");
-            // do not crash
-        }
-    }
-
     if find_ffmpeg_path().is_none() {
         eprintln!("ffmpeg not found. please install ffmpeg and ensure it is in your path.");
         std::process::exit(1);
@@ -557,7 +593,7 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    let resource_monitor = ResourceMonitor::new();
+    let resource_monitor = ResourceMonitor::new(!cli.disable_telemetry);
     resource_monitor.start_monitoring(Duration::from_secs(10));
 
     let db = Arc::new(
@@ -637,13 +673,9 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let audio_chunk_duration = Duration::from_secs(cli.audio_chunk_duration);
-    let (realtime_transcription_sender, _) = tokio::sync::broadcast::channel(1000);
-    let realtime_transcription_sender_clone = realtime_transcription_sender.clone();
-    let (realtime_vision_sender, _) = tokio::sync::broadcast::channel(1000);
-    let realtime_vision_sender = Arc::new(realtime_vision_sender.clone());
-    let realtime_vision_sender_clone = realtime_vision_sender.clone();
     let dm_clone = device_manager.clone();
     let device_manager_clone = device_manager.clone();
+    let device_manager_clone_2 = device_manager.clone();
 
     let (whisper_sender, whisper_receiver) = if cli.disable_audio {
         // Create a dummy channel if no audio devices are available, e.g. audio disabled
@@ -673,10 +705,8 @@ async fn main() -> anyhow::Result<()> {
         let runtime = &tokio::runtime::Handle::current();
         runtime.spawn(async move {
             loop {
-                let realtime_vision_sender_clone = realtime_vision_sender.clone();
                 let vad_engine_clone = vad_engine.clone(); // Clone it here for each iteration
                 let mut shutdown_rx = shutdown_tx_clone.subscribe();
-                let realtime_transcription_sender_clone = realtime_transcription_sender.clone();
 
                 // Create the configs
                 let recording_config = RecordingConfig {
@@ -686,7 +716,7 @@ async fn main() -> anyhow::Result<()> {
                     video_chunk_duration: Duration::from_secs(cli.video_chunk_duration),
                     use_pii_removal: cli.use_pii_removal,
                     capture_unfocused_windows: cli.capture_unfocused_windows,
-                    languages: languages.clone(),
+                    languages: Arc::new(languages.clone()),
                 };
 
                 let audio_config = AudioConfig {
@@ -704,13 +734,8 @@ async fn main() -> anyhow::Result<()> {
                 let vision_config = VisionConfig {
                     disabled: cli.disable_vision,
                     ocr_engine: Arc::new(cli.ocr_engine.clone().into()),
-                    ignored_windows: cli.ignored_windows.clone(),
-                    include_windows: cli.included_windows.clone(),
-                };
-
-                let realtime_config = RealtimeConfig {
-                    transcription_sender: Arc::new(realtime_transcription_sender_clone),
-                    vision_sender: realtime_vision_sender_clone,
+                    ignored_windows: Arc::new(cli.ignored_windows.clone()),
+                    include_windows: Arc::new(cli.included_windows.clone()),
                 };
 
                 let recording_future = start_continuous_recording(
@@ -718,7 +743,6 @@ async fn main() -> anyhow::Result<()> {
                     recording_config,
                     audio_config,
                     vision_config,
-                    realtime_config,
                     &vision_handle,
                     &audio_handle,
                     device_manager.clone(),
@@ -762,7 +786,6 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    let realtime_vision_sender_clone = realtime_vision_sender_clone.clone();
     let server = Server::new(
         db_server,
         SocketAddr::from(([127, 0, 0, 1], cli.port)),
@@ -772,9 +795,6 @@ async fn main() -> anyhow::Result<()> {
         cli.disable_vision,
         cli.disable_audio,
         cli.enable_ui_monitoring,
-        cli.enable_realtime_audio_transcription,
-        realtime_transcription_sender_clone,
-        realtime_vision_sender_clone.clone(),
     );
 
     tokio::spawn(async move {
@@ -1145,11 +1165,41 @@ async fn main() -> anyhow::Result<()> {
     if let Some(pid) = cli.auto_destruct_pid {
         info!("watching pid {} for auto-destruction", pid);
         let shutdown_tx_clone = shutdown_tx.clone();
+        let pipe_manager = pipe_manager.clone();
         tokio::spawn(async move {
             // sleep for 5 seconds
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
             if watch_pid(pid).await {
                 info!("Watched pid ({}) has stopped, initiating shutdown", pid);
+
+                // Get list of enabled pipes
+                let pipes = pipe_manager.list_pipes().await;
+                let enabled_pipes: Vec<_> = pipes.into_iter().filter(|p| p.enabled).collect();
+
+                // Stop all enabled pipes in parallel
+                let stop_futures = enabled_pipes.iter().map(|pipe| {
+                    let pipe_manager = pipe_manager.clone();
+                    let pipe_id = pipe.id.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = pipe_manager.stop_pipe(&pipe_id).await {
+                            error!("failed to stop pipe {}: {}", pipe_id, e);
+                        }
+                    })
+                });
+
+                // Wait for all pipes to stop with timeout
+                let timeout = tokio::time::sleep(Duration::from_secs(10));
+                tokio::pin!(timeout);
+
+                tokio::select! {
+                    _ = futures::future::join_all(stop_futures) => {
+                        info!("all pipes stopped successfully");
+                    }
+                    _ = &mut timeout => {
+                        warn!("timeout waiting for pipes to stop");
+                    }
+                }
+
                 let _ = shutdown_tx_clone.send(());
             }
         });
@@ -1193,7 +1243,7 @@ async fn main() -> anyhow::Result<()> {
 
             loop {
                 tokio::select! {
-                    result = run_ui(realtime_vision_sender_clone.clone()) => {
+                    result = run_ui() => {
                         match result {
                             Ok(_) => break,
                             Err(e) => {
@@ -1297,6 +1347,8 @@ async fn main() -> anyhow::Result<()> {
             let _ = shutdown_tx.send(());
         }
     }
+
+    device_manager_clone_2.shutdown().await;
 
     tokio::task::block_in_place(|| {
         drop(vision_runtime);
@@ -1414,24 +1466,24 @@ async fn handle_pipe_command(
         }
 
         PipeCommand::Info { id, output, port } => {
-            let info = match client
+            let info: ApiResponse<PipeInfo> = match client
                 .get(format!("{}:{}/pipes/info/{}", server_url, port, id))
                 .send()
                 .await
             {
                 Ok(response) if response.status().is_success() => response.json().await?,
-                _ => {
-                    println!("note: server not running, showing pipe configuration");
-                    pipe_manager
+                _ => ApiResponse {
+                    data: pipe_manager
                         .get_pipe_info(&id)
                         .await
-                        .ok_or_else(|| anyhow::anyhow!("pipe not found"))?
-                }
+                        .ok_or_else(|| anyhow::anyhow!("pipe not found"))?,
+                    success: true,
+                },
             };
 
             match output {
-                OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&info)?),
-                OutputFormat::Text => println!("pipe info: {:?}", info),
+                OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&info.data)?),
+                OutputFormat::Text => println!("pipe info: {:?}", info.data),
             }
         }
         PipeCommand::Enable { id, port } => {

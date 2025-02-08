@@ -13,8 +13,23 @@ export class GeminiProvider implements AIProvider {
 		this.client = new GoogleGenerativeAI(apiKey);
 	}
 
+	private createGenerationConfig(body: RequestBody) {
+		const config: any = {
+		  temperature: body.temperature,
+		};
+	
+		if (body.response_format?.type === 'json_schema' && body.response_format.schema) {
+		  config.responseMimeType = 'application/json';
+		  config.responseSchema = body.response_format.schema;
+		} else if (body.response_format?.type === 'json_object') {
+		  config.responseMimeType = 'application/json';
+		}
+	
+		return config;
+	  }
+
 	async createCompletion(body: RequestBody): Promise<Response> {
-		this.model = this.client.getGenerativeModel({ model: body.model });
+		this.model = this.client.getGenerativeModel({ model: body.model, generationConfig: this.createGenerationConfig(body) });
 
 		const chat = this.model.startChat({
 			history: this.formatMessages(body.messages),
@@ -119,5 +134,44 @@ export class GeminiProvider implements AIProvider {
 				},
 			],
 		};
+	}
+
+	async listModels(): Promise<{ id: string; name: string; provider: string }[]> {
+		try {
+			const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models?key=${this.client.apiKey}`);
+
+			if (!response.ok) {
+				throw new Error(`Failed to fetch Gemini models: ${response.statusText}`);
+			}
+
+			const data: { models: any[] } = await response.json();
+			return data.models
+				.filter((model: any) => {
+					// Check if model has generateContent method and is not an embedding model
+					return (
+						model.supportedGenerationMethods?.includes('generateContent') && !model.supportedGenerationMethods?.includes('embedContent')
+					);
+				})
+				.map((model: any) => ({
+					id: model.name.replace('models/', ''),
+					name: model.displayName || model.name.replace('models/', ''),
+					provider: 'google',
+				}));
+		} catch (error) {
+			console.error('Failed to fetch Gemini models:', error);
+			// Updated fallback to only latest models
+			return [
+				{
+					id: 'gemini-1.5-pro',
+					name: 'Gemini 1.5 Pro',
+					provider: 'google',
+				},
+				{
+					id: 'gemini-1.5-flash',
+					name: 'Gemini 1.5 Flash',
+					provider: 'google',
+				},
+			];
+		}
 	}
 }
